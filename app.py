@@ -13,8 +13,19 @@ from PIL import Image, ImageDraw
 pygame.mixer.init()
 toaster = WindowsToaster("Timer & Reminder")
 
-CONFIG_FILE    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-REMINDERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reminders.json")
+def data_dir():
+    """Writable directory — always same folder as the .exe or .py"""
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+DATA_DIR       = data_dir()
+CONFIG_FILE    = os.path.join(DATA_DIR, "config.json")
+REMINDERS_FILE = os.path.join(DATA_DIR, "reminders.json")
+COMPLETED_FILE = os.path.join(DATA_DIR, "completed.json")
 
 RECUR_OPTIONS = [
     "Once", "Hourly", "Daily", "Weekly", "Biweekly",
@@ -585,9 +596,10 @@ class SoundRow(ctk.CTkFrame):
 
 class App(ctk.CTk):
     NAV = [
-        ("reminders","🔔","Reminders"),
-        ("timer",    "⏱","Timer"),
-        ("sounds",   "🔊","Sounds"),
+        ("reminders", "🔔", "Reminders"),
+        ("timer",     "⏱", "Timer"),
+        ("completed", "✅", "Completed"),
+        ("sounds",    "🔊", "Sounds"),
     ]
 
     def __init__(self):
@@ -596,8 +608,13 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         self.title("Timer & Reminder")
-        self.geometry("680x660")
-        self.minsize(620, 580)
+        self.update_idletasks()
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = (sw - 820) // 2
+        y = (sh - 680) // 2
+        self.geometry(f"820x680+{x}+{y}")
+        self.minsize(760, 600)
         self.resizable(True, True)
 
         try: self.iconbitmap(resource_path("app_icon.ico"))
@@ -608,17 +625,49 @@ class App(ctk.CTk):
         self._tsound = cfg.get("timer_sound","")
 
         self.reminders: list[dict] = []
+        self._completed: list[dict] = list(load_json(COMPLETED_FILE, []))
+        now = datetime.now()
         for r in load_json(REMINDERS_FILE, []):
             try:
                 r["next_dt"] = datetime.fromisoformat(r["next_dt_str"])
+                recur = r.get("recur", "Once")
+                # If scheduled time is in the past, handle missed reminder
+                if r["next_dt"] <= now:
+                    if recur == "Once":
+                        # Missed one-shot: mark as missed in completed, skip adding
+                        self._completed.append({
+                            "id": r["id"], "label": r["label"],
+                            "fired_at": r["next_dt_str"],
+                            "status": "missed"
+                        })
+                        save_json(COMPLETED_FILE, self._completed)
+                        continue
+                    elif recur == "Custom":
+                        nd = self._next_custom_dt_static(r.get("schedules", []), after=now)
+                        if nd:
+                            r["next_dt"] = nd
+                            r["next_dt_str"] = nd.isoformat()
+                        else:
+                            continue
+                    else:
+                        # Recurring: fast-forward to next future trigger
+                        nd = r["next_dt"]
+                        while nd <= now:
+                            nd = next_trigger_standard(r["time"], recur, after=nd)
+                        r["next_dt"] = nd
+                        r["next_dt_str"] = nd.isoformat()
                 self.reminders.append(r)
             except Exception: pass
+        save_json(REMINDERS_FILE,
+            [{k:v for k,v in r.items() if k!="next_dt"} for r in self.reminders])
 
         self.timer_secs    = 0
         self.timer_running = False
+        self._sound_playing = False
         self._cards: dict[str, ReminderCard] = {}
+        self._comp_cards: list = []
         self._pages = {}
-        self._pending_custom = []   # schedules from dialog before reminder saved
+        self._pending_custom = []
 
         self._build_shell()
         self._show_page("reminders")
@@ -696,6 +745,7 @@ class App(ctk.CTk):
 
         self._build_reminders_page()
         self._build_timer_page()
+        self._build_completed_page()
         self._build_sounds_page()
 
     def _show_page(self, key):
@@ -890,6 +940,81 @@ class App(ctk.CTk):
 
     # ── Sounds page ───────────────────────────────────────────────────────────
 
+    def _build_completed_page(self):
+        page = ctk.CTkFrame(self._content, fg_color="transparent")
+        page.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+        page.grid_remove()
+        self._pages["completed"] = page
+
+        hdr = ctk.CTkFrame(page, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", pady=(0,12))
+        hdr.columnconfigure(0, weight=1)
+        ctk.CTkLabel(hdr, text="Completed & Missed",
+            font=ctk.CTkFont(family="Segoe UI", size=20, weight="bold"),
+            text_color=("#0f172a","#f8fafc"), anchor="w"
+        ).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(hdr, text="Clear All", width=90, height=30,
+            font=ctk.CTkFont(size=11),
+            fg_color=("#fee2e2","#3f1515"), hover_color=("#fca5a5","#7f1d1d"),
+            text_color=("#991b1b","white"),
+            command=self._clear_completed
+        ).grid(row=0, column=1, sticky="e")
+
+        self._comp_scroll = ctk.CTkScrollableFrame(page,
+            fg_color="transparent",
+            scrollbar_button_color=("#cbd5e1","#2e3250"))
+        self._comp_scroll.grid(row=1, column=0, sticky="nsew")
+        self._comp_scroll.columnconfigure(0, weight=1)
+
+        self._no_comp_lbl = ctk.CTkLabel(self._comp_scroll,
+            text="Nothing here yet.",
+            font=ctk.CTkFont(family="Segoe UI", size=12),
+            text_color=("#94a3b8","#475569"))
+
+        self._refresh_completed()
+
+    def _refresh_completed(self):
+        for w in self._comp_scroll.winfo_children():
+            if w != self._no_comp_lbl: w.destroy()
+        if not self._completed:
+            self._no_comp_lbl.grid(row=0, column=0, pady=24)
+            return
+        self._no_comp_lbl.grid_remove()
+        for i, c in enumerate(self._completed):
+            status = c.get("status","fired")
+            color  = "#dcfce7" if status=="fired" else "#fef3c7"
+            tcolor = "#166534" if status=="fired" else "#92400e"
+            icon   = "✅" if status=="fired" else "⚠️"
+            card = ctk.CTkFrame(self._comp_scroll,
+                fg_color=color, corner_radius=8,
+                border_width=1, border_color=("#e2e8f0","#2e3250"))
+            card.grid(row=i, column=0, sticky="ew", pady=2)
+            card.columnconfigure(1, weight=1)
+            ctk.CTkLabel(card, text=icon, font=ctk.CTkFont(size=13)
+            ).grid(row=0, column=0, padx=(10,6), pady=8)
+            ctk.CTkLabel(card,
+                text=c.get("label","Reminder"),
+                font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold"),
+                text_color=tcolor, anchor="w"
+            ).grid(row=0, column=1, sticky="w", pady=8)
+            fired_str = c.get("fired_at","")
+            try:
+                fired_str = datetime.fromisoformat(fired_str).strftime("%d %b %Y  %H:%M")
+            except Exception: pass
+            status_txt = "Fired" if status=="fired" else "Missed (laptop was off)"
+            ctk.CTkLabel(card,
+                text=f"{status_txt}  •  {fired_str}",
+                font=ctk.CTkFont(family="Segoe UI", size=10),
+                text_color=tcolor, anchor="e"
+            ).grid(row=0, column=2, sticky="e", padx=(4,10), pady=8)
+
+    def _clear_completed(self):
+        self._completed = []
+        self._save_completed()
+        self._refresh_completed()
+
     def _build_sounds_page(self):
         page = ctk.CTkFrame(self._content, fg_color="transparent")
         page.grid(row=0, column=0, sticky="nsew", padx=24, pady=20)
@@ -965,10 +1090,45 @@ class App(ctk.CTk):
 
     def _notify(self, title, msg, path):
         self._play(path)
+        self._sound_playing = True
         self.after(0, lambda: self._toast(title, msg))
+        self.after(0, lambda: self._show_stop_banner(title, msg))
 
     def _toast(self, title, msg):
         t = Toast(); t.text_fields = [title, msg]; toaster.show_toast(t)
+
+    def _show_stop_banner(self, title, msg):
+        """Floating banner at bottom of window with Stop Sound button."""
+        if hasattr(self, "_banner") and self._banner.winfo_exists():
+            self._banner.destroy()
+        banner = ctk.CTkFrame(self,
+            fg_color="#fef3c7", corner_radius=10,
+            border_width=1, border_color="#f59e0b")
+        banner.place(relx=0.5, rely=0.97, anchor="s", relwidth=0.7)
+        self._banner = banner
+        ctk.CTkLabel(banner,
+            text=f"🔔 {title}: {msg}",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#92400e", anchor="w"
+        ).grid(row=0, column=0, sticky="ew", padx=12, pady=8)
+        banner.columnconfigure(0, weight=1)
+        ctk.CTkButton(banner,
+            text="⏹ Stop Sound", width=110, height=28,
+            font=ctk.CTkFont(size=11),
+            fg_color="#f59e0b", hover_color="#d97706",
+            text_color="white",
+            command=self._stop_sound
+        ).grid(row=0, column=1, padx=(0,8), pady=8)
+        # Auto-dismiss after 30 seconds
+        self.after(30000, lambda: banner.destroy() if banner.winfo_exists() else None)
+
+    def _stop_sound(self):
+        try:
+            pygame.mixer.music.stop()
+        except Exception: pass
+        self._sound_playing = False
+        if hasattr(self, "_banner") and self._banner.winfo_exists():
+            self._banner.destroy()
 
     def _need_sound(self, kind):
         p = self._rsound if kind=="r" else self._tsound
@@ -979,6 +1139,14 @@ class App(ctk.CTk):
         return True
 
     # ── Reminder logic ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _next_custom_dt_static(schedules, after=None):
+        candidates = []
+        for s in schedules:
+            dt = next_trigger_for_schedule(s, after=after)
+            if dt: candidates.append(dt)
+        return min(candidates) if candidates else None
 
     def _add_reminder(self):
         if not self._need_sound("r"): return
@@ -1032,11 +1200,7 @@ class App(ctk.CTk):
         self._pending_custom = []
 
     def _next_custom_dt(self, schedules, after=None):
-        candidates = []
-        for s in schedules:
-            dt = next_trigger_for_schedule(s, after=after)
-            if dt: candidates.append(dt)
-        return min(candidates) if candidates else None
+        return self._next_custom_dt_static(schedules, after=after)
 
     def _delete_reminder(self, rid):
         self.reminders = [r for r in self.reminders if r["id"] != rid]
@@ -1053,6 +1217,20 @@ class App(ctk.CTk):
                 c = ReminderCard(self.rem_scroll, rem, on_delete=self._delete_reminder)
                 c.grid(row=i, column=0, sticky="ew", pady=2)
                 self._cards[rem["id"]] = c
+
+    def _save_completed(self):
+        save_json(COMPLETED_FILE, self._completed)
+
+    def _add_completed(self, rem, status="fired"):
+        self._completed.insert(0, {
+            "id": rem["id"],
+            "label": rem["label"],
+            "fired_at": datetime.now().isoformat(timespec="seconds"),
+            "recur": rem.get("recur","Once"),
+            "status": status
+        })
+        self._save_completed()
+        self._refresh_completed()
 
     def _save_reminders(self):
         save_json(REMINDERS_FILE,
@@ -1092,9 +1270,11 @@ class App(ctk.CTk):
                 recur = rem.get("recur","Once")
 
                 if recur == "Once":
+                    self._add_completed(rem, status="fired")
                     self.reminders = [r for r in self.reminders if r["id"] != rem["id"]]
                     self._save_reminders(); self._refresh_cards()
                 elif recur == "Custom":
+                    self._add_completed(rem, status="fired")
                     nd = self._next_custom_dt(rem.get("schedules",[]), after=now)
                     if nd:
                         rem["next_dt"] = nd
@@ -1103,10 +1283,10 @@ class App(ctk.CTk):
                         c = self._cards.get(rem["id"])
                         if c: c.update_countdown((nd - now).total_seconds())
                     else:
-                        # all custom dates exhausted
                         self.reminders = [r for r in self.reminders if r["id"] != rem["id"]]
                         self._save_reminders(); self._refresh_cards()
                 else:
+                    self._add_completed(rem, status="fired")
                     nd = next_trigger_standard(rem["time"], recur, after=now)
                     rem["next_dt"] = nd
                     rem["next_dt_str"] = nd.isoformat()
@@ -1127,6 +1307,12 @@ class App(ctk.CTk):
                 self.timer_sub.configure(text="Done! ✓")
                 self._notify("Timer","Timer finished!", self._tsound)
                 self.timer_running = False
+                self._completed.insert(0, {
+                    "id": str(uuid.uuid4()), "label": "Timer finished",
+                    "fired_at": datetime.now().isoformat(timespec="seconds"),
+                    "recur": "Once", "status": "fired"
+                })
+                self._save_completed(); self._refresh_completed()
 
         self.after(1000, self._tick)
 
