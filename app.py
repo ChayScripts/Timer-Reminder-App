@@ -122,6 +122,156 @@ def next_trigger_for_schedule(sched, after=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Calendar popup
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CalendarPopup(ctk.CTkToplevel):
+    """Lightweight month-grid date picker. Writes YYYY-MM-DD into target_entry."""
+
+    DAYS_HDR = ["Mo","Tu","We","Th","Fr","Sa","Su"]
+
+    def __init__(self, master, target_entry):
+        super().__init__(master)
+        self.overrideredirect(True)          # borderless
+        self.attributes("-topmost", True)
+        self._entry = target_entry
+        self._entry.update_idletasks()
+
+        # Try to pre-fill from existing entry value
+        try:
+            d = datetime.strptime(target_entry.get().strip(), "%Y-%m-%d")
+            self._year, self._month = d.year, d.month
+        except Exception:
+            now = datetime.now()
+            self._year, self._month = now.year, now.month
+
+        self.configure(fg_color="#ffffff")
+        self._build()
+        self._position()
+        self.grab_set()
+        self.bind("<FocusOut>", lambda e: self._maybe_close(e))
+
+    def _position(self):
+        e = self._entry
+        x = e.winfo_rootx()
+        y = e.winfo_rooty() + e.winfo_height() + 4
+        self.geometry(f"+{x}+{y}")
+
+    def _maybe_close(self, event):
+        try:
+            if not str(self.focus_get()).startswith(str(self.winfo_id())):
+                self.destroy()
+        except Exception:
+            self.destroy()
+
+    def _build(self):
+        for w in self.winfo_children():
+            w.destroy()
+
+        outer = ctk.CTkFrame(self, fg_color="#ffffff",
+            corner_radius=10, border_width=1, border_color="#e2e8f0")
+        outer.pack(padx=0, pady=0)
+
+        # Header: prev / Month Year / next
+        hdr = ctk.CTkFrame(outer, fg_color="#6366f1", corner_radius=8)
+        hdr.grid(row=0, column=0, sticky="ew", padx=0, pady=0)
+        hdr.columnconfigure(1, weight=1)
+
+        ctk.CTkButton(hdr, text="‹", width=32, height=30,
+            fg_color="transparent", hover_color="#4f46e5",
+            text_color="white", font=ctk.CTkFont(size=16),
+            command=self._prev_month
+        ).grid(row=0, column=0)
+
+        ctk.CTkLabel(hdr,
+            text=f"{calendar.month_abbr[self._month]} {self._year}",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="white"
+        ).grid(row=0, column=1)
+
+        ctk.CTkButton(hdr, text="›", width=32, height=30,
+            fg_color="transparent", hover_color="#4f46e5",
+            text_color="white", font=ctk.CTkFont(size=16),
+            command=self._next_month
+        ).grid(row=0, column=2)
+
+        # Jump row: year entry + month dropdown
+        jump = ctk.CTkFrame(outer, fg_color="#f8fafc")
+        jump.grid(row=1, column=0, sticky="ew", pady=(4,0))
+        ctk.CTkLabel(jump, text="Year:", font=ctk.CTkFont(size=10),
+            text_color="#64748b").grid(row=0, column=0, padx=(8,4), pady=4)
+        self._year_entry = ctk.CTkEntry(jump, width=58, height=24,
+            justify="center", font=ctk.CTkFont(size=11))
+        self._year_entry.insert(0, str(self._year))
+        self._year_entry.grid(row=0, column=1, padx=(0,6))
+        ctk.CTkButton(jump, text="Go", width=36, height=24,
+            font=ctk.CTkFont(size=10),
+            fg_color="#6366f1", hover_color="#4f46e5",
+            command=self._jump_year
+        ).grid(row=0, column=2, padx=(0,8))
+
+        # Day headers
+        grid_frame = ctk.CTkFrame(outer, fg_color="#ffffff")
+        grid_frame.grid(row=2, column=0, padx=8, pady=(4,8))
+
+        for c, d in enumerate(self.DAYS_HDR):
+            ctk.CTkLabel(grid_frame, text=d, width=30,
+                font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#94a3b8"
+            ).grid(row=0, column=c)
+
+        # Day buttons
+        cal = calendar.monthcalendar(self._year, self._month)
+        today = datetime.now().date()
+        for r, week in enumerate(cal):
+            for c, day in enumerate(week):
+                if day == 0:
+                    ctk.CTkLabel(grid_frame, text="", width=30
+                    ).grid(row=r+1, column=c)
+                else:
+                    this_date = date(self._year, self._month, day)
+                    is_today = this_date == today
+                    is_past  = this_date < today
+                    fg = "#6366f1" if is_today else ("transparent" if not is_past else "#f1f5f9")
+                    tc = "white" if is_today else ("#cbd5e1" if is_past else "#0f172a")
+                    ctk.CTkButton(grid_frame,
+                        text=str(day), width=30, height=28,
+                        corner_radius=14,
+                        fg_color=fg, hover_color="#e0e7ff",
+                        text_color=tc,
+                        font=ctk.CTkFont(size=11),
+                        command=lambda d=day: self._pick(d)
+                    ).grid(row=r+1, column=c, padx=1, pady=1)
+
+    def _prev_month(self):
+        self._month -= 1
+        if self._month < 1:
+            self._month = 12; self._year -= 1
+        self._build()
+
+    def _next_month(self):
+        self._month += 1
+        if self._month > 12:
+            self._month = 1; self._year += 1
+        self._build()
+
+    def _jump_year(self):
+        try:
+            y = int(self._year_entry.get())
+            if 1900 < y < 2200:
+                self._year = y
+                self._build()
+        except ValueError:
+            pass
+
+    def _pick(self, day):
+        val = f"{self._year:04d}-{self._month:02d}-{day:02d}"
+        self._entry.delete(0, "end")
+        self._entry.insert(0, val)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Custom recurrence dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -182,11 +332,18 @@ class CustomRecurDialog(ctk.CTkToplevel):
         # Date input (hidden initially)
         self._date_frame = ctk.CTkFrame(top, fg_color="transparent")
         self._date_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(8,0))
-        ctk.CTkLabel(self._date_frame, text="Date (YYYY-MM-DD):",
+        ctk.CTkLabel(self._date_frame, text="Date:",
             font=ctk.CTkFont(size=11)).grid(row=0, column=0, padx=(0,8))
-        self._date_entry = ctk.CTkEntry(self._date_frame, width=130,
-            placeholder_text="2025-12-25", justify="center")
+        self._date_entry = ctk.CTkEntry(self._date_frame, width=120,
+            placeholder_text="YYYY-MM-DD", justify="center")
         self._date_entry.grid(row=0, column=1)
+        ctk.CTkButton(self._date_frame, text="📅", width=34, height=30,
+            font=ctk.CTkFont(size=14),
+            fg_color=("#e0e7ff","#2e3a6e"),
+            hover_color=("#c7d2fe","#3a4a80"),
+            text_color=("#3730a3","#a5b4fc"),
+            command=self._open_calendar
+        ).grid(row=0, column=2, padx=(6,0))
         self._date_frame.grid_remove()
 
         # Time input
@@ -236,6 +393,9 @@ class CustomRecurDialog(ctk.CTkToplevel):
             font=ctk.CTkFont(size=13),
             command=self.destroy
         ).grid(row=0, column=1, padx=8)
+
+    def _open_calendar(self):
+        CalendarPopup(self, self._date_entry)
 
     def _toggle_type(self):
         if self._stype.get() == "weekdays":
